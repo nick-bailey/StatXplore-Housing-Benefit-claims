@@ -1,0 +1,1356 @@
+---
+output:
+  html_document: default
+  word_document: default
+---
+title:  "HBen data for LSOAs - v6"
+author: "Nick Bailey"
+date:   "22/12/2021"
+output: html_document
+---
+
+
+
+# Housing Benefit Claims by tenure for LSOAs in Britain, 2011-21
+
+Aug 2023: Updated various API calls which had broken. Some data (for UC in 2020 and 2021) appears to have been updated (modest reductions in claims, affecting c. 40% of LSOAs in 2021). No impact on Hsng Studies paper. 
+
+This file compiles data on Housing Benefit (HB) claims at Lower Super Output Area (LSOA) level for the years 2011 onwards on a consistent geography, with a breakdown by tenure (social vs private renting). This includes Universal Credit (UC) claims with a housing element (2016 onwards).
+
+Data are pulled from the DWP's StatXplore site. One issue is the limit on the size of each API request which means that LSOAs have to be processed in sub-national blocks. After experimenting with the 'statxplorer' package, I opted instead to create lists of LSOAs from csv files on the web, divide them into equal-sized blocks, and use these to create the JSON queries. This approach was more easily adapted and extended. 
+
+HB data are provided for two different versions of LSOA geographies: 
+
+* Nov 2008 to Mar 2018, using LSOAs based on 2001 Census OA geographies
+* Apr 2018 onwards, using LSOAs based on 2011 Census OA geographies
+
+UC data are all for the 2011 LSOA geographies. A further stage in the process is therefore to re-constitute HB data for 2001 geographies to the 2011 geographies. The approach has been to apportion the data for 2001 LSOAs to 2011 Census Output Areas (OAs) on the basis of housing tenure profiles for the latter, then aggregate 2011 OAs to 2011 LSOAs. Slightly different approaches are adopted in Scotland and in England and Wales. A simpler approach can be applied to the latter. However, for a small number of LSOAs in England and Wales (N=153 in 2011, 0.4% of total), no estimates have been produced by this method so these LSOAs are omitted from the final database for all years. 
+
+StatXplore suppresses small cell values (<5) and applies some random noise which makes it difficult to impute missing values with any degree of reliability. Suppressed cells are therefore treated as zero. In Scotland, as an illustration of the impact this has, this resulted in the loss of 0.3% of claims in social renting and 2.5% of claims in private renting (April 2018 data, comparing sum of LSOA claims with total for Scotland). 
+
+Resources: 
+
+* StatXplore HB metadata: https://stat-xplore.dwp.gov.uk/webapi/metadata/hb_full/hb_full.html
+* Example API query: https://www.trafforddatalab.io/open_data_companion/#Stat-Xplore
+* R package: https://github.com/houseofcommonslibrary/statxplorer/
+
+
+
+
+```{r setup, echo = FALSE}
+# knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# # install packages
+# install.packages("remotes")
+# remotes::install_github("houseofcommonslibrary/statxplorer")
+
+# load packages
+pacman::p_load(zoo, httr, jsonlite, RCurl, gt, feather, here, sf, lubridate, ggrepel, tidyverse, readxl)
+
+# api key
+api_key <- read_file(here("data_private", "statxplore_api_key.txt"))
+
+```
+
+
+## LSOA lists
+Make lists of LSOA codes, etc.
+
+### 2001 LSOA codes
+
+NB: Scottish LSOAs (Datazones) for 2011 do not have unique names. In some authorities, the names were given as e.g. "IZ01 - 01" (i.e. DZ '1' in Intermediate Zone '1' for that authority). Hence there are some duplicate DZ names so matching on DZ name does not give the correct result. Names may have been developed for these DZ later so some lookup files provide specific names but the version on StatXplore does not. 
+
+
+```{r lsoa01 ew}
+
+# 2001 LSOA list - Eng/Wal [34,378]
+# https://geoportal.statistics.gov.uk/datasets/ons::lower-layer-super-output-areas-december-2001-names-and-codes-in-england-and-wales-1/explore
+# Licence: "Source: Office for National Statistics licensed under the Open Government Licence v.3.0."
+
+# api endpoint
+api_path <- "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/LSOA__2001__names_and_codes_EW_as_at_02_04/FeatureServer/0/query?where=1%3D1&outFields=*&outSR=4326&f=json"
+
+# get number of IDs
+request <- POST(
+  url = paste0(api_path, '&returnIdsOnly=true'),
+  encode = "json")
+# get response
+response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+cases_n = length(response$objectIds)
+loop_n = ceiling(cases_n/32000)    # max cases returned is 32,000
+
+# submit the API request
+temp <- data.frame()
+for (i in 1:loop_n) {
+  offset <- (i-1) * 32000
+  request <- POST(
+  url = paste0(api_path, '&resultType=standard', '&resultOffset=', offset),
+  encode = "json")
+  # # check status
+  # print(http_status(request))
+  # get response
+  response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+  temp <- temp %>% 
+    rbind(response$features)
+}
+
+# tidy
+df_lsoa01_ew <- temp %>% 
+  select(lsoa_code = attributes.LSOA04CD,
+         lsoa_name = attributes.LSOA04NM) %>% 
+  arrange(lsoa_code)
+
+
+```
+
+
+```{r lsoa01 sc}
+
+# 2001 LSOA list - Scotland (N = 6505)
+# https://www.opendata.nhs.scot/dataset/geography-codes-and-labels/resource/e92d19d4-ced7-40c8-b628-e28e4528fc41
+df_lsoa01_sc <- read_csv("https://www.opendata.nhs.scot/dataset/9f942fdb-e59e-44f5-b534-d6e17229cc7b/resource/e92d19d4-ced7-40c8-b628-e28e4528fc41/download/dz2001_codes_and_labels_21042020.csv") %>% 
+  select(lsoa_code = DataZone, 
+         lsoa_name = DataZoneName) %>% 
+  arrange(lsoa_code)
+
+
+```
+
+
+```{r lsoa01 combine}
+
+# 2001 LSOA list - all [40,883]
+df_lsoa01 <- df_lsoa01_ew %>% 
+  rbind(df_lsoa01_sc)
+
+# n_distinct(df_lsoa01$lsoa_code)
+
+rm(df_lsoa01_ew)
+rm(df_lsoa01_sc)
+
+```
+
+### 2011 LSOA codes
+
+```{r lsoa11 ew}
+
+# 2011 LSOA list - Eng/Wal [34,753]
+# https://geoportal.statistics.gov.uk/datasets/ons::lower-layer-super-output-areas-december-2011-names-and-codes-in-england-and-wales-1/explore
+# Licence: "Source: Office for National Statistics licensed under the Open Government Licence v.3.0."
+
+# api endpoint
+api_path <- "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/LSOA_2011_EW_NC_6fe4968cc083413988b2c5d643e1d248/FeatureServer/0/query?where=1%3D1&outFields=*&outSR=4326&f=json"
+
+# get number of IDs
+request <- POST(
+  url = paste0(api_path, '&returnIdsOnly=true'),
+  encode = "json")
+# get response
+response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+cases_n = length(response$objectIds)
+loop_n = ceiling(cases_n/32000)    # max cases returned is 32,000
+
+# submit the API request
+temp <- data.frame()
+for (i in 1:loop_n) {
+  offset <- (i-1) * 32000
+  request <- POST(
+  url = paste0(api_path, '&resultType=standard', '&resultOffset=', offset),
+  encode = "json")
+  # # check status
+  # print(http_status(request))
+  # get response
+  response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+  temp <- temp %>% 
+    rbind(response$features)
+}
+names(temp) <- gsub("attributes.", "", names(temp))
+
+# tidy
+df_lsoa11_ew <- temp %>% 
+  select(lsoa_code = LSOA11CD, 
+         lsoa_name = LSOA11NM) %>% 
+  arrange(lsoa_code)
+
+```
+
+
+```{r lsoa11 sc}
+
+# 2011 LSOA list - Scotland (N = 6976)
+# https://geoportal.statistics.gov.uk/datasets/ons::data-zones-december-2011-names-and-codes-in-scotland-1/explore
+
+# api endpoint
+api_path <- "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/DZ_DEC_2011_SC_NC_45ae61d197ca46658b7431e39e1eb3de/FeatureServer/0/query?where=1%3D1&outFields=*&outSR=4326&f=json"
+
+# get number of IDs
+request <- POST(
+  url = paste0(api_path, '&returnIdsOnly=true'),
+  encode = "json")
+# get response
+response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+cases_n = length(response$objectIds)
+loop_n = ceiling(cases_n/32000)    # max cases returned is 32,000
+
+# submit the API request
+temp <- data.frame()
+for (i in 1:loop_n) {
+  offset <- (i-1) * 32000
+  request <- POST(
+  url = paste0(api_path, '&resultType=standard', '&resultOffset=', offset),
+  encode = "json")
+  # # check status
+  # print(http_status(request))
+  # get response
+  response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+  temp <- temp %>% 
+    rbind(response$features)
+}
+names(temp) <- gsub("attributes.", "", names(temp))
+
+df_lsoa11_sc <- temp %>% 
+  select(lsoa_code = DZ11CD, 
+         lsoa_name = DZ11NM) %>% 
+  arrange(lsoa_code)
+
+```
+
+
+```{r lsoa11 combine}
+
+# 2011 LSOA list - all [41,729]
+df_lsoa11 <- df_lsoa11_ew %>% 
+  rbind(df_lsoa11_sc)
+
+# n_distinct(df_lsoa11$lsoa_code)
+
+
+
+```
+
+
+## HB claims for LSOAs (E/W/S)
+Using lists of LSOA codes from above, breaking list into smaller groups due to limits on file size in API response, cycling through dates, writing query for each group/date, and amalgamating into one df. 
+
+
+### 2001 geographies
+Cycling through succession of dates for LSOAs with 2001 geographies. 
+
+```{r HB 01}
+
+# api endpoint - table
+api_path <- "https://stat-xplore.dwp.gov.uk/webapi/rest/v1/table"
+
+
+# list of dates - April of each year
+list_dates <- paste0(2011:2017, "04")
+
+
+# set LSOA list to 2001
+df_lsoa <- df_lsoa01
+
+
+# empty dfs for outer loop
+temp_j <- data.frame()
+temp_j_codes <- data.frame()
+
+# loop rounds years
+for (j in list_dates) {
+  
+  # print(j)
+
+  # empty dfs for inner loop
+  temp_i <- data.frame()
+  temp_i_codes <- data.frame()
+  
+  # loop rounds LSOAs in 8 groups
+  for (i in 1:8) {
+    
+    # print(i)
+    
+    # identify rows from LSOA list to use this iteration
+    row_start <- (i-1)*ceiling(nrow(df_lsoa)/8) + 1
+    row_end <- min(i * ceiling(nrow(df_lsoa)/8), nrow(df_lsoa))
+    
+    # list of LSOAs - class 'character'
+    list_lsoa <- c(paste0("str:value:hb_full:V_F_HB_FULL:COA_CODE:V_C_GEOG05_LSOA_to_MSOA:", 
+                          df_lsoa$lsoa_code[row_start:row_end])) 
+  
+    # query
+    query_i <- list(database = unbox("str:database:hb_full"),
+                  measures = "str:count:hb_full:V_F_HB_FULL",
+                  dimensions = c("str:field:hb_full:V_F_HB_FULL:COA_CODE",
+                                 "str:field:hb_full:V_F_DATE:DATE2",
+                                 "str:field:hb_full:V_F_HB_FULL:TENURE_PUB") %>% matrix(),
+                  recodes = list(
+                    `str:field:hb_full:V_F_HB_FULL:COA_CODE` = list(
+                      map = as.list(list_lsoa)),
+                    `str:field:hb_full:V_F_DATE:DATE2` = list(
+                      map = list(paste0("str:value:hb_full:V_F_DATE:DATE2:V_C_DATE:", 
+                                        j))),
+                    `str:field:hb_full:V_F_HB_FULL:TENURE_PUB` = list(
+                      map = list("str:value:hb_full:V_F_HB_FULL:TENURE_PUB:C_HOUSING_SECTOR:1",
+                                 "str:value:hb_full:V_F_HB_FULL:TENURE_PUB:C_HOUSING_SECTOR:2",
+                                 "str:value:hb_full:V_F_HB_FULL:TENURE_PUB:C_HOUSING_SECTOR:99"))
+                  )) %>% toJSON()
+  
+    # submit the API request
+    request <- POST(
+      url = api_path,
+      body = query_i,
+      config = add_headers(APIKey = api_key),
+      encode = "json")
+  
+    # # check status
+    # print(http_status(request))
+     
+    # parse the response
+    response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+    
+    # extract list items and convert to a dataframe
+    dimnames <- response$fields$items %>% map(~.$labels %>% unlist)
+    values <- response$cubes[[1]]$values
+    dimnames(values) <- dimnames
+    temp <- as.data.frame.table(values, stringsAsFactors = FALSE) %>%
+      as_tibble() %>%
+      set_names(c(response$fields$label,"value"))
+    
+    # get lsoa codes
+    temp_codes <- response$fields$items %>% 
+      map(~.$uris %>% unlist)
+    temp_codes <- as.data.frame(temp_codes[1])
+    colnames(temp_codes) <- c("lsoa_code")
+    temp_codes <- temp_codes %>% 
+      mutate(lsoa_code = substr(lsoa_code, 
+                                 (nchar(lsoa_code) - 8), 
+                                 nchar(lsoa_code)))
+    
+    # append to dfs
+    temp_i <- temp_i %>% 
+      rbind(temp)
+    # here repeat 3x - one for each tenure
+    temp_i_codes <- temp_i_codes %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes)
+    
+  }
+  
+  # append to dfs
+  temp_j <- temp_j %>% 
+    rbind(temp_i)
+  temp_j_codes <- temp_j_codes %>% 
+      rbind(temp_i_codes)
+}
+  
+
+# tidy colnames
+colnames(temp_j) <- c("lsoa_name", "date", "tenure", "claimants")
+
+# make final df and tidy
+# - NB fix Scottish LSOA codes manually as lsoa_name is blank for them  XXXXXXXXXX
+df_hb01 <- temp_j %>% 
+  cbind(lsoa_code = temp_j_codes$lsoa_code) %>%
+  mutate(year = as.numeric(substr(date, 1, 4)), 
+         month = as.numeric(substr(date, 5,6)), 
+         tenure = factor(tenure, 
+                         levels = c("Social Rented Sector", 
+                                    "Private Rented Sector", 
+                                    "Unknown or missing housing sector"), 
+                         labels = c("Social", 
+                                    "Private", 
+                                    "Unknown")),
+         benefit = "HB", 
+         lsoa_geog = "LSOA01") 
+  
+  
+# checking number of LSOAs for which there are data in each year
+# - 40,883 expected
+df_hb01 %>%
+  group_by(year) %>%
+  summarise(n = n_distinct(lsoa_code))
+
+
+
+```
+
+
+### 2011 geographies
+Cycling through succession of dates for LSOAs with 2011 geographies.  
+
+```{r HB 11}
+
+# api endpoint - table
+api_path <- "https://stat-xplore.dwp.gov.uk/webapi/rest/v1/table"
+
+
+# list of dates - April of each year
+list_dates <- paste0(2018:2021, "04")
+
+# set LSOA list to 2011
+df_lsoa <- df_lsoa11
+
+
+# empty dfs for outer loop
+temp_j <- data.frame()
+temp_j_codes <- data.frame()
+
+# loop rounds years
+for (j in list_dates) {
+  
+  # print(j)
+
+  # empty dfs for inner loop
+  temp_i <- data.frame()
+  temp_i_codes <- data.frame()
+  
+  # loop rounds LSOAs in 8 groups
+  for (i in 1:8) {
+    
+    # print(i)
+    
+    # identify rows from LSOA list to use this iteration
+    row_start <- (i-1)*ceiling(nrow(df_lsoa)/8) + 1
+    row_end <- min(i * ceiling(nrow(df_lsoa)/8), nrow(df_lsoa))
+    
+    # list of LSOAs - class 'character'
+    list_lsoa <- c(paste0("str:value:hb_new:V_F_HB_NEW:COA_CODE:V_C_MASTERGEOG11_LSOA_TO_MSOA:", 
+                          df_lsoa$lsoa_code[row_start:row_end])) 
+  
+    # query
+    query_i <- list(database = unbox("str:database:hb_new"),
+                  measures = "str:count:hb_new:V_F_HB_NEW",
+                  dimensions = c("str:field:hb_new:V_F_HB_NEW:COA_CODE",
+                                 "str:field:hb_new:F_HB_NEW_DATE:NEW_DATE_NAME",
+                                 "str:field:hb_new:V_F_HB_NEW:TENURE_PUB") %>% matrix(),
+                  recodes = list(
+                    `str:field:hb_new:V_F_HB_NEW:COA_CODE` = list(
+                      map = as.list(list_lsoa)),
+                    `str:field:hb_new:F_HB_NEW_DATE:NEW_DATE_NAME` = list(
+                      map = list(paste0("str:value:hb_new:F_HB_NEW_DATE:NEW_DATE_NAME:C_HB_NEW_DATE:", 
+                                        j))),
+                    `str:field:hb_new:V_F_HB_NEW:TENURE_PUB` = list(
+                      map = list("str:value:hb_new:V_F_HB_NEW:TENURE_PUB:C_HOUSING_SECTOR:1",
+                                 "str:value:hb_new:V_F_HB_NEW:TENURE_PUB:C_HOUSING_SECTOR:2",
+                                 "str:value:hb_new:V_F_HB_NEW:TENURE_PUB:C_HOUSING_SECTOR:99"))
+                  )) %>% toJSON()
+  
+    # submit the API request
+    request <- POST(
+      url = api_path,
+      body = query_i,
+      config = add_headers(APIKey = api_key),
+      encode = "json")
+  
+    # # check status
+    # print(http_status(request))
+     
+    # parse the response
+    response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+    
+    # extract list items and convert to a dataframe
+    dimnames <- response$fields$items %>% map(~.$labels %>% unlist)
+    values <- response$cubes[[1]]$values
+    dimnames(values) <- dimnames
+    temp <- as.data.frame.table(values, stringsAsFactors = FALSE) %>%
+      as_tibble() %>%
+      set_names(c(response$fields$label,"value"))
+    
+    # get lsoa codes
+    temp_codes <- response$fields$items %>% 
+      map(~.$uris %>% unlist)
+    temp_codes <- as.data.frame(temp_codes[1])
+    colnames(temp_codes) <- c("lsoa_code")
+    temp_codes <- temp_codes %>% 
+      mutate(lsoa_code = substr(lsoa_code, 
+                                 (nchar(lsoa_code) - 8), 
+                                 nchar(lsoa_code)))
+    
+    # append to dfs
+    temp_i <- temp_i %>% 
+      rbind(temp)
+    # here repeat 3x - one for each tenure
+    temp_i_codes <- temp_i_codes %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes)
+    
+  }
+  
+  # append to dfs
+  temp_j <- temp_j %>% 
+    rbind(temp_i)
+  temp_j_codes <- temp_j_codes %>% 
+      rbind(temp_i_codes)
+  
+}
+  
+
+# tidy colnames
+colnames(temp_j) <- c("lsoa_name", "date", "tenure", "claimants")
+
+# make final df and tidy - NEW VERSION
+df_hb11 <- temp_j %>%
+  cbind(lsoa_code = temp_j_codes$lsoa_code) %>%
+  mutate(year = as.numeric(substr(date, 1, 4)),
+         month = as.numeric(substr(date, 5,6)),
+         tenure = factor(tenure,
+                         levels = c("Social Rented Sector",
+                                    "Private Rented Sector",
+                                    "Unknown or missing housing sector"),
+                         labels = c("Social",
+                                    "Private",
+                                    "Unknown")),
+         benefit = "HB",
+         lsoa_geog = "LSOA11") %>%
+  select(lsoa_code, lsoa_name, tenure, year, month, claimants,
+         benefit, lsoa_geog)
+
+# checking number of LSOAs for which there are data
+df_hb11 %>%
+  group_by(year) %>%
+  summarise(n = n_distinct(lsoa_code))
+
+```
+
+
+## UC claims with housing element for 2011 LSOAs
+From 2016, UC begins to replace a number of benefits for working-age households and, where relevant, incorporates the Housing Benefit within the claim.
+
+Cycling through succession of dates (April 2017 onwards) for LSOAs with 2011 geographies. For reasons best known to DWP, the date format for UC claims is different to that for HB claims ("April 2020" c.w. "202004 (Apr-20)"). 
+
+
+```{r UC 11}
+
+# # to get schema info
+# # api endpoint for schema
+# api_path <- "https://stat-xplore.dwp.gov.uk/webapi/rest/v1/schema/"
+# 
+# # schema households on UC
+# request <- GET(
+#   url = paste0(api_path, 'str:field:UC_Households:F_UC_HH_DATE:DATE_NAME'),
+#   config = add_headers(APIKey = api_key),
+#   encode = "json")
+# # print(http_status(request))
+# response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+# temp <- response$children
+
+
+
+# api endpoint for tables
+api_path <- "https://stat-xplore.dwp.gov.uk/webapi/rest/v1/table"
+
+# list of dates - April of each year e.g. "201804"
+list_dates <- paste0(2017:2021, "04")
+
+# set LSOA list to 2011
+df_lsoa <- df_lsoa11
+
+# empty dfs for outer loop
+temp_j <- data.frame()
+temp_j_codes <- data.frame()
+
+# loop rounds dates
+for (j in list_dates) {
+  
+  # print(j)
+
+  # empty dfs for inner loop
+  temp_i <- data.frame()
+  temp_i_codes <- data.frame()
+  
+  # loop rounds LSOAs in 8 groups
+  for (i in 1:8) {
+    
+    # print(i)
+    
+    # identify rows from LSOA list to use this iteration
+    row_start <- (i-1)*ceiling(nrow(df_lsoa)/8) + 1
+    row_end <- min(i * ceiling(nrow(df_lsoa)/8), nrow(df_lsoa))
+    
+    # list of LSOAs - class 'character'
+    list_lsoa <- c(paste0("str:value:UC_Households:V_F_UC_HOUSEHOLDS:COA_CODE:V_C_MASTERGEOG11_LSOA_TO_MSOA:",
+                          df_lsoa$lsoa_code[row_start:row_end]))
+  
+    # # query
+    # query_i <- list(database = unbox("str:database:UC_Households"),
+    #               measures = "str:count:UC_Households:V_F_UC_HOUSEHOLDS",
+    #               dimensions = c("str:field:UC_Households:V_F_UC_HOUSEHOLDS:COA_CODE",
+    #                              "str:field:UC_Households:F_UC_DATE:DATE_NAME",
+    #                              "str:field:UC_Households:V_F_UC_HOUSEHOLDS:TENURE") %>% matrix(),
+    #               recodes = list(
+    #                 `str:field:UC_Households:V_F_UC_HOUSEHOLDS:COA_CODE` = list(
+    #                   map = as.list(list_lsoa)),
+    #                 `str:field:UC_Households:F_UC_DATE:DATE_NAME` = list(
+    #                   map = list(paste0("str:value:UC_Households:F_UC_DATE:DATE_NAME:C_UC_DATE:", 
+    #                                     j))),
+    #                 `str:field:UC_Households:V_F_UC_HOUSEHOLDS:TENURE` = list(
+    #                   map = list("str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_ENTITLEMENT:0",
+    #                              "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_ENTITLEMENT:1",
+    #                              "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_TENURE:1", 
+    #                              "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_TENURE:2",
+    #                              "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_TENURE:3"))
+    #               )) %>% toJSON()
+
+    # query updated Aug 2023
+    query_i <- list(database = unbox("str:database:UC_Households"),
+                  measures = "str:count:UC_Households:V_F_UC_HOUSEHOLDS",
+                  dimensions = c("str:field:UC_Households:V_F_UC_HOUSEHOLDS:COA_CODE",
+                                 "str:field:UC_Households:F_UC_HH_DATE:DATE_NAME",
+                                 "str:field:UC_Households:V_F_UC_HOUSEHOLDS:TENURE") %>% matrix(),
+                  recodes = list(
+                    `str:field:UC_Households:V_F_UC_HOUSEHOLDS:COA_CODE` = list(
+                      map = as.list(list_lsoa)),
+                    `str:field:UC_Households:F_UC_HH_DATE:DATE_NAME` = list(
+                      map = list(paste0("str:value:UC_Households:F_UC_HH_DATE:DATE_NAME:C_UC_HH_DATE:", 
+                                        j))),
+                    `str:field:UC_Households:V_F_UC_HOUSEHOLDS:TENURE` = list(
+                      map = list("str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_ENTITLEMENT:0",
+                                 "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_ENTITLEMENT:1",
+                                 "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_TENURE:1", 
+                                 "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_TENURE:2",
+                                 "str:value:UC_Households:V_F_UC_HOUSEHOLDS:TENURE:C_UC_HOUSING_TENURE:3"))
+                  )) %>% toJSON()
+
+    # submit the API request
+    request <- POST(
+      url = api_path,
+      body = query_i,
+      config = add_headers(APIKey = api_key),
+      encode = "json")
+  
+    # # check status
+    # print(http_status(request))
+
+    # parse the response
+    response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+    
+    # extract list items and convert to a dataframe
+    dimnames <- response$fields$items %>% map(~.$labels %>% unlist)
+    values <- response$cubes[[1]]$values
+    dimnames(values) <- dimnames
+    temp <- as.data.frame.table(values, stringsAsFactors = FALSE) %>%
+      as_tibble() %>%
+      set_names(c(response$fields$label,"value"))
+    
+    # get lsoa codes
+    temp_codes <- response$fields$items %>% 
+      map(~.$uris %>% unlist)
+    temp_codes <- as.data.frame(temp_codes[1])
+    colnames(temp_codes) <- c("lsoa_code")
+    temp_codes <- temp_codes %>% 
+      mutate(lsoa_code = substr(lsoa_code, 
+                                 (nchar(lsoa_code) - 8), 
+                                 nchar(lsoa_code)))
+    
+    # append to dfs
+    temp_i <- temp_i %>% 
+      rbind(temp)
+    # here repeat 5x - one for each tenure
+    temp_i_codes <- temp_i_codes %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes) %>% 
+      rbind(temp_codes)
+    
+  }
+  
+  # append to dfs
+  temp_j <- temp_j %>% 
+    rbind(temp_i)
+  temp_j_codes <- temp_j_codes %>% 
+      rbind(temp_i_codes)
+}
+
+
+# tidy colnames
+colnames(temp_j) <- c("lsoa_name", "date", "tenure", "claimants")
+
+
+# make final df and tidy
+df_uc11 <- temp_j %>% 
+  cbind(lsoa_code = temp_j_codes$lsoa_code) %>%
+  mutate(year = as.numeric(substr(date, nchar(date)-3, nchar(date))), 
+         month = as.numeric("04"), 
+         tenure = factor(tenure, 
+                         levels = c("Social Rented Sector", 
+                                    "Private Rented Sector", 
+                                    "Other or unknown", 
+                                    "No", 
+                                    "Yes"), 
+                         labels = c("Social", 
+                                    "Private", 
+                                    "Unknown", 
+                                    "HB - no", 
+                                    "HB - yes")),
+         benefit = "UC", 
+         lsoa_geog = "LSOA11")
+
+
+# # proportions with and without HB - roughly 60:40
+# df_uc11 %>%
+#   filter(grepl("HB", tenure)) %>%
+#   group_by(tenure) %>%
+#   summarise(claimants = sum(claimants)) %>%
+#   mutate(tenure_pct = 100*claimants/sum(claimants))
+
+
+# reduce dataset to cases with HB element only
+# - NB align tenure factor levels with the HB data
+df_uc11 <- df_uc11 %>% 
+  filter(!grepl("HB", tenure)) %>%
+  mutate(tenure = factor(as.character(tenure), 
+                         levels = c("Social", 
+                                    "Private", 
+                                    "Unknown"))) %>% 
+  select(lsoa_code, lsoa_name, tenure, year, month, claimants, 
+         benefit, lsoa_geog)
+
+
+# # checking number of LSOAs for which there are data
+# df_uc11 %>% 
+#   group_by(year) %>% 
+#   summarise(n = n_distinct(lsoa_code))
+
+
+# delete unwanted temp objects
+rm(temp_i)
+rm(temp_j)
+rm(temp)
+rm(temp_i_codes)
+rm(temp_j_codes)
+rm(temp_codes)
+rm(request)
+rm(response)
+rm(dimnames)
+rm(values)
+rm(df_lsoa)
+
+```
+
+
+## Combining the HB & UC data
+
+The first step is to convert HB data for 2001 LSOAs to 2011 LSOAs. 
+
+### England & Wales
+Start here as simpler process as the great majority of 2001 LSOAs are identical in 2011, and most of the rest are formed by merging 2+ 2001 LSOAs or splitting 2001 LSOAs into 2+ 2011 LSOAs. 
+
+```{r geog convert EW}
+
+# E+W: more straightforward as 99% of LSOAs map 1:1, 1:n or n:1
+# updated location: https://geoportal.statistics.gov.uk/datasets/ons::lower-layer-super-output-area-2001-to-lower-layer-super-output-area-2011-to-local-authority-district-2011-lookup-in-england-and-wales-1/explore
+
+# api endpoint
+api_path <- "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/LSOA01_LSOA11_LAD11_EW_LU_ddfe1cd1c2784c9b991cded95bc915a9/FeatureServer/0/query?where=1%3D1&outFields=*&outSR=4326&f=json"
+
+# get number of IDs
+request <- POST(
+  url = paste0(api_path, '&returnIdsOnly=true'),
+  encode = "json")
+# get response
+response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+cases_n = length(response$objectIds)
+loop_n = ceiling(cases_n/32000)    # max cases returned is 32,000
+
+# submit the API request
+temp <- data.frame()
+for (i in 1:loop_n) {
+  offset <- (i-1) * 32000
+  request <- POST(
+  url = paste0(api_path, '&resultType=standard', '&resultOffset=', offset),
+  encode = "json")
+  # # check status
+  # print(http_status(request))
+  # get response
+  response <- fromJSON(content(request, as = "text"), flatten = TRUE)
+  temp <- temp %>% 
+    rbind(response$features)
+}
+
+# tidy names
+names(temp) <- gsub("attributes.", "", names(temp))
+
+df_lsoa0111_ew <- temp %>% 
+  select(lsoa_code_01 = LSOA01CD, 
+         lsoa_code_11 = LSOA11CD, 
+         chgind = CHGIND)
+
+# chgind:
+# - U - unchanged [33519]
+# - S - split 2001 LSOA to 2+ 2011 LSOAs (~1%) [383 to 922]
+# - M - merged 2+ 2001 LSOAs to one 2011 LSOA (~1%) [313 to 155]
+# - X - more complex (~0.5%) [163 to 153]
+
+
+# # 2001 LSOAs by change
+# df_lsoa0111_ew %>%
+#   group_by(lsoa_code_01) %>%
+#   summarise(chgind = first(chgind)) %>%
+#   group_by(chgind) %>%
+#   summarise(n = n())
+# 
+# # 2011 LSOAs by change
+# df_lsoa0111_ew %>%
+#   group_by(lsoa_code_11) %>%
+#   summarise(chgind = first(chgind)) %>%
+#   group_by(chgind) %>%
+#   summarise(n = n())
+
+
+# 1. unchanged group
+
+# df for unchanged
+temp_unchanged <- df_lsoa0111_ew %>% 
+  filter(chgind == "U")
+
+# select HB data for unchanged 2001 LSOAs and just re-label the var as 2011  
+# - N = 7 yr x 3 tenure x 33,519 = 703,899
+temp_u <- df_hb01 %>% 
+  filter(lsoa_code %in% temp_unchanged$lsoa_code_01) %>% 
+  mutate(lsoa_geog = "LSOA11") %>% 
+  select(lsoa_code, lsoa_name, tenure, year, month, claimants, 
+         benefit, lsoa_geog)
+
+
+# 2. merge group
+# - combine 2001 LSOAs and label with 2011 code
+
+# df of mergers
+temp_merge <- df_lsoa0111_ew %>% 
+  filter(chgind == "M") 
+
+# filter 2001 data to merged LSOAs, add 2011 LSOA code they merge to
+# - N = 7 years x 3 tenures x 313
+temp_m <- df_hb01 %>% 
+  filter(lsoa_code %in% temp_merge$lsoa_code_01) %>% 
+  left_join(temp_merge, by = c("lsoa_code" = "lsoa_code_01")) 
+  
+# merge
+# - N = 7 years x 3 tenures x 155
+temp_m <- temp_m %>% 
+  group_by(tenure, year, month, lsoa_code_11, lsoa_name) %>% 
+  summarise(claimants = sum(claimants)) %>% 
+  rename(lsoa_code = lsoa_code_11) %>% 
+  mutate(benefit = "HB", 
+         lsoa_geog = "LSOA11") %>% 
+  select(lsoa_code, lsoa_name, tenure, year, month, claimants, 
+         benefit, lsoa_geog)
+
+
+# 3. split group
+# - apportion data from 2001 LSOAs into 2011 LSOAs in proportion
+#   to earliest data for 2011 LSOAs (2018), by tenure
+
+# df of splits
+temp_split <- df_lsoa0111_ew %>% 
+  filter(chgind == "S") 
+
+# make split_share - % of 2001 data to each 2011 LSOA (by tenure) 
+# - where missing (NaN), set to equal shares
+# - N = 3 tenures x 922 = 2766
+temp_s_s <- df_hb11 %>% 
+  filter(lsoa_code %in% temp_split$lsoa_code_11 &
+           year == 2018) %>% 
+  select(lsoa_code, lsoa_name, tenure, claimants) %>% 
+  rename(lsoa_code_11 = lsoa_code, 
+         lsoa_name_11 = lsoa_name) %>% 
+  left_join(temp_split, by = c("lsoa_code_11"= "lsoa_code_11")) %>% 
+  arrange(lsoa_code_01, tenure) %>% 
+  group_by(lsoa_code_01, tenure) %>% 
+  mutate(split_share = claimants/sum(claimants), 
+         n = n()) %>% 
+  mutate(split_share = case_when(is.nan(split_share) ~ 1/n, 
+                                 TRUE ~ split_share)) %>% 
+  select(- claimants, - chgind, - n)
+
+# filter 2001 data to split LSOAs, add 2011 LSOA code and split_shares
+#   and apportion earlier data
+# - N = 7 years x 3 tenures x 922 = 19362
+temp_s <- df_hb01 %>% 
+  filter(lsoa_code %in% temp_split$lsoa_code_01) %>% 
+  left_join(temp_s_s, by = c("lsoa_code" = "lsoa_code_01", "tenure" = "tenure")) %>% 
+  mutate(claimants = claimants * split_share, 
+         lsoa_geog = "LSOA11") %>% 
+  select(lsoa_code = lsoa_code_11, lsoa_name = lsoa_name_11, 
+         tenure, year, month, claimants, benefit, lsoa_geog)
+
+
+# 4. missing group (X)
+
+# df of complex joins
+temp_complex <- df_lsoa0111_ew %>% 
+  filter(chgind == "X") 
+
+# # filter 2001 data to complex LSOAs and sum claimants (~147k)
+# df_hb01 %>% 
+#   filter(lsoa_code %in% temp_complex$lsoa_code_01 &
+#            tenure != "Unknown") %>% 
+#   summarise(claimants = sum(claimants))
+  
+
+
+# checking
+
+# initial combine of HB01 data for 2011 LSOAs
+df_hb01_lsoa11 <- temp_u %>% 
+  rbind(temp_m) %>% 
+  rbind(temp_s)
+
+
+# # 1. number of 2011 LSOAs in reconstituted HB data
+# # - there are 34,753 LSOAs in total in 2011 and 34,596 in the reconstituted data
+# # - so [34753-34596=] 157 of the 2011 LSOAs for E/W have no data 
+# # - 153 are 'X' so not included in U/M/S table so just 4 others (presumed zero)
+# n_distinct(df_lsoa11_ew$lsoa_code)
+# n_distinct(df_hb01_lsoa11$lsoa_code)
+# 
+# 
+# # 2. number of claims
+# # summarise HB on original 2001 DZs
+# temp1 <- df_hb01 %>% 
+#   filter(!grepl("S", lsoa_code) & 
+#            tenure != "Unknown") %>% 
+#   group_by(year, tenure) %>% 
+#   summarise(claimants_01 = sum(claimants))
+# 
+# # summarise HB on revised 2011 DZs, join previous and calc missing pct
+# temp2 <- df_hb01_lsoa11 %>% 
+#   filter(tenure != "Unknown") %>% 
+#   group_by(year, tenure) %>% 
+#   summarise(claimants_11 = sum(claimants)) %>% 
+#   cbind(claimants_01 = temp1$claimants_01) %>% 
+#   mutate(missing = claimants_01 - claimants_11, 
+#          missing_pct = 100 * missing/claimants_01)
+# 
+# # overall missing ~147k or 0.48%
+# # - this is wholly accounted for by the LSOAs from 2001 lacking simple fit to 2011
+# temp2 %>% 
+#   ungroup() %>% 
+#   summarise(claimants_11 = sum(claimants_11),
+#             claimants_01 = sum(claimants_01)) %>% 
+#   mutate(missing = claimants_01 - claimants_11, 
+#          missing_pct = 100 * missing/claimants_01)
+
+
+# final stage 
+# - identify the 4 LSOAs in 2011 which have no data and not 'X'
+list_blanks <- df_lsoa11_ew %>% 
+  select(lsoa_code) %>% 
+  filter(!(lsoa_code %in% df_hb01_lsoa11$lsoa_code)) %>% 
+  filter(!(lsoa_code %in% temp_complex$lsoa_code_11)) %>% 
+  pull(lsoa_code)
+
+# - make df with 'blank' LSOAs
+temp_blanks <- expand.grid(lsoa_code = list_blanks, lsoa_name = "",
+                      tenure = 1:2, year = 2011:2017) %>% 
+  mutate(tenure = factor(tenure, labels = c("Social", "Private")),
+         month = 4,
+         claimants = 0, 
+         benefit = "HB", 
+         lsoa_geog = "LSOA11")  
+
+# - merge onto the combined file
+df_hb01_lsoa11 <- df_hb01_lsoa11 %>% 
+  rbind(temp_blanks)
+
+# n_distinct(df_hb01_lsoa11$lsoa_code)
+
+rm(df_lsoa11_ew)
+rm(df_lsoa11_sc)
+
+```
+
+
+### Scotland
+Similar but more complex process for Scottish Datazones:
+
+1. get 2001 & 2011 DZ boundaries and 2011 OA centroids 
+2. add 2001 DZ identifier to 2001 DZs
+3. get 2011 OA Census data on number of households in social and private renting
+4. apportion 2001 DZ data for social and private renting HB claims to 2011 OAs in proportion to number of households in relevant tenure
+5. get 2011 OA to DZ lookup 
+6. sum estimated claims for social and private renting in 2011 OAs to 2011 DZs
+7. fix issues with ten 2001 DZ with no 2011 OAs
+8. check total unchanged
+
+```{r geog convert Scot 1 2}
+
+# 1a. get 2001 DZ boundaries
+# downloaded from: https://www.data.gov.uk/dataset/0752e075-f422-42a8-b50b-e490648fc4b5/data-zone-boundaries-2001
+sf_dz01 <- here("data_input", "dz01", "SG_DataZone_Bdry_2001.shp") %>% 
+  st_read() %>% 
+  rename(dz01_code = DZ_CODE) %>% 
+  arrange(dz01_code) %>% 
+  mutate(ID = row_number())
+
+# 1b. get 2011 DZ boundaries
+# downloaded from: https://www.data.gov.uk/dataset/ab9f1f20-3b7f-4efa-9bd2-239acf63b540/data-zone-boundaries-2011
+sf_dz11 <- here("data_input", "dz11", "SG_DataZone_Bdry_2011.shp") %>% 
+  st_read() %>% 
+  rename(dz11_code = DataZone) %>% 
+  arrange(dz11_code) %>% 
+  mutate(ID = row_number())
+
+# 1c. get 2011 OA centroids
+# page: https://www.nrscotland.gov.uk/statistics-and-data/geography/our-products/census-datasets/2011-census/2011-indexes
+sf_oa11 <- here("data_input", "oa11", "OutputArea2011_PWC.shp") %>% 
+  st_read() %>% 
+  rename(oa11_code = code) %>% 
+  arrange(OBJECTID)
+
+## 
+# OA11 S00112515 (BROOMHILL, GLASGOW) - Master PCode G11 7HG; OBJECTID 17334
+# DZ01 S01003560 (BROOMHILL, GLASGOW)
+
+
+# 2. add 2001 DZ identifier to 2011 OAs
+# - produces matching pairs OA11/DZ01 
+# - two oa11 not allocated to a DZ01 - likely centroid falls in sea - not a problrm
+df_oa11_dz01 <- as.data.frame(st_within(sf_oa11, sf_dz01, sparse = TRUE))
+
+
+# THIS DOES NOT WORK
+# - PROBLEM IS NOT WITH CONVERSION OF row.id/col.id TO OA11 OR DZ01
+# - SO PROBLEM MUST LIE WITH ORIGINAL LOOKUP FILES
+# - E.G OA11 S00112515 (BROOMHILL, GLASGOW) ALLOCATED TO 
+# -     DZ01 S01001873 (EDINBURGH)
+# - BUT 2011 0A-DZ-IZ LOOKUP CSV HAS IT IN DZ11 S01010416 WHICH IS BROOMHILL/CORRECT
+# - SO FAULT MUST LIE WITH 1c. OA CENTROIDS FROM SHP FILE???
+
+
+df_oa11_dz01 <- df_oa11_dz01 %>% 
+  left_join(sf_oa11, by = c("row.id" = "OBJECTID")) %>% 
+  left_join(sf_dz01, by = c("col.id" = "ID")) %>% 
+  select(oa11_code, dz01_code)
+
+# checking
+# - OA11 S00112515 (BROOMHILL, GLASGOW) - Master PCode G11 7HG; OBJECTID 17334
+# - DZ01 S01003560 (BROOMHILL, GLASGOW)
+
+
+# # five DZ01 with no OA11 to pass data on to - handled later
+# sf_dz01 %>% 
+#   select(dz01_code) %>% 
+#   filter(!(dz01_code %in% df_oa11_dz01$dz01_code))
+
+
+# 3. get 2011 OA Census data on number of households in social and private renting 
+# from: https://www.scotlandscensus.gov.uk/documents/2011-census-table-data-output-area-2011/
+# - KS402SC - housing tenure (households)
+# - drop row for Scotland
+df_oa11_tenure <- read_csv(here("data_input", "oa11", "KS402SC.csv"), 
+                            na = c("-")) %>% 
+  rename(oa11_code = `...1`) %>% 
+  filter(!grepl("S92", oa11_code)) %>% 
+  replace(is.na(.), 0)%>% 
+  mutate(social = `Rented: Council (Local authority)` +
+                      `Rented: Other social rented`, 
+         private = `Rented: Private landlord or letting agency`) %>% 
+  select(oa11_code, social, private) 
+
+# merge tenure onto oa11/dz01 lookup, pivot longer
+#   and make share of dz01 going to each oa11 by tenure
+# - N = 46,349 OAs x 2 tenures = 92,698
+df_oa11_dz01_share <- df_oa11_dz01 %>% 
+  left_join(df_oa11_tenure, by = "oa11_code") %>% 
+  pivot_longer(cols = c("social", "private"),
+               names_to = "tenure", 
+               values_to = "hhlds") %>% 
+  arrange(dz01_code, tenure) %>% 
+  mutate(tenure = factor(tenure, 
+                         levels = c("social", 
+                                    "private"), 
+                         labels = c("Social", 
+                                    "Private"))) %>% 
+  group_by(dz01_code, tenure) %>% 
+  mutate(share = hhlds/sum(hhlds), 
+         n = n())
+
+# # 218 NaNs for 'share' - where no soc &/or priv rental hsng
+# # - gives divide by zero error
+# df_oa11_dz01_share %>%
+#   filter(is.na(share)) %>% 
+#   arrange(dz01_code, tenure)
+
+# in these cases, make share of HBen claims equal across OA11s
+df_oa11_dz01_share <- df_oa11_dz01_share %>% 
+  group_by(dz01_code, tenure) %>% 
+  mutate(share = case_when(is.na(share) ~ 1/n, 
+                           TRUE ~ share))
+
+# # check sum of shares equals no. DZ01 (divide by two for tenure)
+# # - expect 6500 as 5 DZ01 have no matching OA11 at this stage
+# sum(df_oa11_dz01_share$share)/2
+
+
+# 4. apportion 2001 DZ data ... to 2011 OAs ...
+# - drop the 5 DZ01 with no matching OA11 
+# - N = 46349 2011 OAs x 2 tenure x 7 year = 648,886
+
+
+df_hb01_oa11 <- df_hb01 %>% 
+  filter(grepl("S", lsoa_code) & 
+           tenure != "Unknown") %>% 
+  select(lsoa_code, year, tenure, claimants) %>% 
+  left_join(df_oa11_dz01_share, by = c("lsoa_code" = "dz01_code", "tenure" = "tenure")) %>% 
+  filter(!is.na(share)) %>% 
+  mutate(claimants = claimants * share) 
+
+# # checking
+# # no. DZ01 covered
+# length(unique(df_hb01_oa11$lsoa_code))
+# 
+# # sum of shares / 14 (7 yrs x 2 tenures)
+# sum(df_hb01_oa11$share)/14
+
+
+# 5. get 2011 OA to DZ lookup 
+
+# 2011 OAs to DZs lookup
+# - not sure why direct open from website not working
+# df_oa11_dz11 <- read_xlsx("https://www.nrscotland.gov.uk/files//geography/2011-census/OA_DZ_IZ_2011.xlsx")
+df_oa11_dz11 <- read_xlsx(here("data_input", "OA_DZ_IZ_2011.xlsx")) %>% 
+  select(oa11_code = OutputArea2011Code, 
+         dz11_code = DataZone2011Code)
+
+
+# 6. sum estimated claims ... in 2011 OAs to 2011 DZs
+
+# match on to df_hb01_oa11 and aggregate to DZ 2011
+# - N = 6976 DZ x 7 years x 2 tenures = 97664
+# - so data for every DZ 2011
+df_hb01_dz11 <- df_hb01_oa11 %>% 
+  left_join(df_oa11_dz11, by = "oa11_code") %>% 
+  group_by(dz11_code, year, tenure) %>% 
+  summarise(claimants = sum(claimants)) %>% 
+  mutate(month = 4, 
+         benefit = "HB", 
+         lsoa_geog = "LSOA11") %>% 
+  left_join(sf_dz11, by = "dz11_code") %>% 
+  select(lsoa_code = dz11_code, lsoa_name = Name,
+         tenure, year, month,
+         claimants, benefit, lsoa_geog)
+
+
+# # check at this stage
+# # claimants in Scotland in original df_hb01
+# temp1 <- df_hb01 %>%
+#   filter(grepl("S", lsoa_code) &
+#            tenure != "Unknown") %>%
+#   summarise(claimants_01 = sum(claimants))
+# 
+# # claimants in Scotland in re-shaped df_hb01 and hence 'missing'
+# # - 'missing' = 200 
+# df_hb01_dz11 %>%
+#   ungroup() %>%
+#   summarise(claimants_11 = sum(claimants)) %>%
+#   cbind(temp1) %>%
+#   mutate(missing = claimants_01 - claimants_11,
+#          missing_pct = 100 * missing/claimants_01)
+# 
+# # five DZ01 with no OA11 to pass data on to
+# temp2 <- sf_dz01 %>%
+#   select(dz01_code) %>%
+#   filter(!(dz01_code %in% df_oa11_dz01$dz01_code))
+# 
+# # claims in these DZ101 total 200 - matches 'missing'
+# df_hb01 %>% 
+#   filter(lsoa_code %in% temp2$dz01_code) %>% 
+#   summarise(sum = sum(claimants))
+
+
+# 7. fix issues with five 2001 DZ with no 2011 OAs
+
+# identify five dz01 with no oa11
+temp1 <- sf_dz01 %>% 
+  select(dz01_code) %>% 
+  filter(!(dz01_code %in% df_oa11_dz01$dz01_code))
+
+# # plot shows they are v small dz so plausible that no centroids fall within
+# sf_dz01 %>%
+#   mutate(yn = (dz01_code %in% temp1$dz01_code)) %>%
+#   ggplot(aes(x = Shape_Area, group = yn)) +
+#   geom_boxplot(aes(fill = yn))
+
+# make lookup from dz01 to dz11, using centroid of dz01
+df_dz01_dz11 <- as.data.frame(st_within(st_centroid(temp1), sf_dz11, sparse = TRUE)) 
+df_dz01_dz11 <- df_dz01_dz11 %>% 
+  cbind(dz01_code = temp1$dz01_code) %>% 
+  # NB that dz11 codes start at 6505 and now up to five digits 
+  mutate(dz11_code = paste0("S010", as.character(sprintf("%05d", col.id + 6505)))) %>% 
+  select(dz01_code, dz11_code)
+
+# add hb01 data
+# - 5 DZ x 7 yrs x 2 tenures = 70
+# - NB that lsoa_name from left_join is dropped (2001 name) and 2011 name added
+temp2 <- df_dz01_dz11 %>% 
+  left_join(df_hb01, by = c("dz01_code" = "lsoa_code")) %>% 
+  filter(tenure != "Unknown") %>% 
+  mutate(lsoa_geog = "LSOA11") %>% 
+  left_join(sf_dz11, by = "dz11_code") %>% 
+  select(lsoa_code = dz11_code, 
+         lsoa_name = Name,
+         tenure, year, month, claimants, benefit, lsoa_geog)
+
+# merge onto df_hb01_dz11 - so end up with same number of rows
+# - 6976 DZ x 7 yr x 2 tenure = 97,664
+df_hb01_dz11 <- df_hb01_dz11 %>% 
+  rbind(temp2) %>% 
+  group_by(lsoa_code, lsoa_name, tenure, year) %>% 
+  summarise(claimants = sum(claimants)) %>% 
+  mutate(month = 4, benefit = "HB", lsoa_geog = "LSOA11") %>% 
+  select(lsoa_code, lsoa_name, 
+         tenure, year, month, claimants, benefit, lsoa_geog)
+
+
+
+# # 8. checking total HB claims by tenure/year for Scotland unchanged
+# 
+# # check at this stage
+# # claimants in Scotland in original df_hb01
+# temp1 <- df_hb01 %>%
+#   filter(grepl("S", lsoa_code) &
+#            tenure != "Unknown") %>%
+#   summarise(claimants_01 = sum(claimants))
+# 
+# # claimants in Scotland in re-shaped df_hb01
+# df_hb01_dz11 %>%
+#   ungroup() %>%
+#   summarise(claimants_11 = sum(claimants)) %>%
+#   cbind(temp1) %>%
+#   mutate(missing = claimants_01 - claimants_11,
+#          missing_pct = 100 * missing/claimants_01)
+
+
+```
+
+### Merge to final dataframe
+Merge the various dataframes, now all at 2011 geographies.
+
+```{r merge & tidy}
+
+# combine the HB and UC files
+df_hb_uc <- df_uc11 %>% 
+  rbind(df_hb11) %>% 
+  rbind(df_hb01_lsoa11) %>% 
+  rbind(df_hb01_dz11) 
+
+
+# remove (i) LSOAs for E/W in HB11 and UC11 data where no data for earlier years
+#   (ii) 'unknown' tenure - only present for 2018 onwards
+# leaves a consistent set of areas and tenures across all years
+df_hb_uc <- df_hb_uc %>% 
+  filter(!(lsoa_code %in% temp_complex$lsoa_code_11) & 
+           tenure != "Unknown")
+
+
+# delete unwanted dfs
+
+rm(temp1)
+rm(temp2)
+rm(temp3)
+rm(temp_u)
+rm(temp_m)
+rm(temp_s)
+rm(temp_s_s)
+rm(temp_merge)
+rm(temp_split)
+rm(temp_unchanged)
+rm(temp_complex)
+rm(temp_blanks)
+
+```
+
+
+## Initial exploration
+
+Number of claims by benefit (HB vs UC).
+
+```{r summary 1}
+
+# plot nos claimed by benefit 
+df_hb_uc %>% 
+  group_by(year, benefit) %>% 
+  summarise(claimants = sum(claimants)) %>% 
+  ggplot(aes(x = factor(year), y = claimants)) +
+  geom_bar(aes(fill = benefit), stat = "identity")
+
+```
+
+Number of (2011) LSOAs for which we have data in each year. Data available consistently for 41,576 LSOAs.  
+
+```{r summary 2}
+
+# nos LSOAs by year 
+df_hb_uc %>% 
+  group_by(year) %>% 
+  summarise(n = n_distinct(lsoa_code))
+
+```
+
+## Save to csv and feather
+
+Save a reduced version to minimise size. 
+
+```{r save}
+
+# save reduced version of file
+temp <- df_hb_uc %>% 
+  select(- lsoa_name, - month, - lsoa_geog)
+
+# write_csv(temp, here("data", "HB_UC_LSOA_2011_2021 Aug23.csv"))
+
+write_feather(temp, here("data", "HB_UC_LSOA_2011_2021 Aug23.feather"))
+
+```
+
+
+This compares the latest version of the file with the version used in the resubmitted draft of the paper. There are some changes in UC counts for 2020 and (more so) 2021 but these have no impact on the paper since it stops in 2019/20 (pre-pandemic). 
+
+```{r checking}
+
+# get version used previous
+temp_old <- read_feather(here("data", "HB_UC_LSOA_2011_2021.feather"))
+colnames(temp_old) <- paste0(colnames(temp_old), '_old')
+
+# all same except 'claimants' col - diffs average .06
+all.equal(temp, temp_old)
+
+# df with rows which have any diff in claimants
+# all are UC claims in 2020 or 2021, social and private
+# in 2021, affect 17k LSOAs (40%)
+temp1 <- temp %>% 
+  cbind(temp_old) %>% 
+  filter(claimants != claimants_old) %>% 
+  mutate(diff = claimants - claimants_old, 
+         diff_pct = 100 * diff/claimants_old, 
+         country = substr(lsoa_code, 1, 1))
+
+# summary
+temp1 %>% 
+  group_by(year, tenure, benefit) %>% 
+  summarise(n = n(), 
+            claimants = sum(claimants), 
+            claimants_old = sum(claimants_old), 
+            diff = sum(diff)) %>% 
+  mutate(diff_pct = 100 * diff/claimants_old)
+
+# plot
+temp1 %>% 
+  ggplot(aes(x = claimants_old, y = claimants)) +
+  geom_point()
+
+
+
+```
+
+## Session info
+
+```{r session}
+
+sessionInfo() 
+
+```
+
